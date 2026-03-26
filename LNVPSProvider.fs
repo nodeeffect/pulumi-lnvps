@@ -234,12 +234,16 @@ Response: {responseBody}"""
                             match template with
                             | Some templateObject -> templateObject.GetProperty("id").GetUInt64()
                             | None -> failwithf "Could not find custom template with region id = %i" regionId
+
+                        let bytesInGigabyte = 1024.0 ** 3
+                        let memoryInBytes = self.GetPropertyNumber(request.Properties, "memory", __LINE__) * bytesInGigabyte
+                        let diskInBytes = self.GetPropertyNumber(request.Properties, "disk", __LINE__) * bytesInGigabyte
                         let customVmOrderObject =
                             {|
                                 pricing_id = pricingId
                                 cpu = self.GetPropertyNumber(request.Properties, "cpu", __LINE__)
-                                memory = self.GetPropertyNumber(request.Properties, "memory", __LINE__)
-                                disk = self.GetPropertyNumber(request.Properties, "disk", __LINE__)
+                                memory = memoryInBytes
+                                disk = diskInBytes
                                 disk_type = self.GetPropertyString(request.Properties, "disk_type", __LINE__)
                                 disk_interface = self.GetPropertyString(request.Properties, "disk_interface", __LINE__)
                                 image_id = imageId
@@ -417,11 +421,11 @@ Response: {responseBody}"""
                                 },
                                 "memory": {
                                     "type": "integer",
-                                    "description": "Memory in bytes"
+                                    "description": "Memory in Gigabytes"
                                 },
                                 "disk": {
                                     "type": "integer",
-                                    "description": "Disk size in bytes"
+                                    "description": "Disk size in Gigabytes"
                                 },
                                 "disk_type": {
                                     "type": "string",

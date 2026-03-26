@@ -82,7 +82,7 @@ namespace Pulumi.Lnvps
         public Input<int>? Cpu { get; set; }
 
         /// <summary>
-        /// Disk size in bytes
+        /// Disk size in Gigabytes
         /// </summary>
         [Input("disk")]
         public Input<int>? Disk { get; set; }
@@ -106,7 +106,7 @@ namespace Pulumi.Lnvps
         public Input<int>? ImageId { get; set; }
 
         /// <summary>
-        /// Memory in bytes
+        /// Memory in Gigabytes
         /// </summary>
         [Input("memory")]
         public Input<int>? Memory { get; set; }
