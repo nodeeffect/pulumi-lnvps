@@ -3,6 +3,7 @@
 open System
 open System.Collections.Generic
 open System.Collections.Immutable
+open System.IO
 open System.Linq
 open System.Net
 open System.Net.Http
@@ -125,6 +126,54 @@ type LNVPSProvider(nostrPrivateKey: string) =
                 return raise <| RequestFailed(method, relativeUrl, contentString, response.StatusCode, responseBody)
         }
     
+    member self.AsyncGetInvoice (vmId: uint64) = 
+        async {
+            let! invoiceResponse = self.AsyncSendRequest($"/api/v1/vm/{vmId}/renew?method=lightning", HttpMethod.Get)
+            let! invoiceResponseBody = invoiceResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+            let invoiceData = JsonDocument.Parse(invoiceResponseBody).RootElement.GetProperty "data"
+            return invoiceData
+        }
+
+    member self.AsyncSendInvoiceViaTelegram (sendTgScriptFile: FileInfo) (invoiceData: JsonElement) (vmName: string) (vmExpirationDate: Option<DateTime>) =
+        async {
+            let invoice = invoiceData.GetProperty("data").GetProperty("lightning").GetString()
+            let milliSatsAmount = invoiceData.GetProperty("amount").GetDecimal()
+            let milliSatsInBTC = pown 10.0m (8 + 3)
+            let btcAmount = milliSatsAmount / milliSatsInBTC
+            let invoiceExpiryDate = invoiceData.GetProperty("expires").GetString() |> DateTime.Parse
+            let minutesUntilInvoiceExpiry = int (invoiceExpiryDate - DateTime.UtcNow).TotalMinutes
+            
+            let tgMessage = 
+                let invoiceInfo = $"({btcAmount} BTC, expires on {invoiceExpiryDate}, in {minutesUntilInvoiceExpiry} minutes)"
+                let message = 
+                    match vmExpirationDate with
+                    | Some expirationDate -> 
+                        let expirationDateString = expirationDate.ToString("yyyy-MM-dd")
+                        let daysUntilExpiration = (expirationDate - DateTime.UtcNow).TotalDays
+                        let daysUntilExpirationRounded = daysUntilExpiration |> round |> int
+                        $"VM {vmName} expires on {expirationDateString}, in {daysUntilExpirationRounded} days.
+Invoice for renewal {invoiceInfo}:"
+                    | None ->  $"Invoice for creation of new VM '{vmName}' {invoiceInfo}:"
+                String.Join(Environment.NewLine, "[Automated Message]", message)
+
+            let tgMessageWithInvoice = invoice
+
+            for message in [ tgMessage; tgMessageWithInvoice ] do
+                let sendTgResult =
+                    Execute(
+                        { ProcessDetails.Command = "dotnet"; Arguments = $"fsi {sendTgScriptFile.FullName} \"{message}\"" }, 
+                        Echo.Off
+                    )
+                match sendTgResult.Result with
+                | Error (errorCode, output) -> 
+                    return failwith $"""Sending Telegram message with invoice failed with code {errorCode}.
+    STDOUT: {output.StdOut}
+    STDERR: {output.StdErr}
+    Working directory: {Environment.CurrentDirectory}
+    """
+                | _ -> ()
+        }
+
     member private self.AsyncGetVMStatus(vmId: uint64) =
         async {
             let! response = self.AsyncSendRequest($"/api/v1/vm/{vmId}", HttpMethod.Get)
@@ -301,33 +350,12 @@ type LNVPSProvider(nostrPrivateKey: string) =
             let vmStatus = JsonDocument.Parse(responseBody).RootElement.GetProperty "data"
             let vmId = vmStatus.GetProperty("id").GetUInt64()
                 
-            // Send invoice via Tg
-            let! invoiceResponse = self.AsyncSendRequest($"/api/v1/vm/{vmId}/renew?method=lightning", HttpMethod.Get)
-            let! invoiceResponseBody = invoiceResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
-            let invoiceData = JsonDocument.Parse(invoiceResponseBody).RootElement.GetProperty "data"
+            let! invoiceData = self.AsyncGetInvoice vmId
             let paymentId = invoiceData.GetProperty("id").GetString()
-            let invoice = invoiceData.GetProperty("data").GetProperty("lightning").GetString()
-            let amount = invoiceData.GetProperty("amount").GetUInt64()
-            let tgMessage = $"[Automated Message]
-    Invoice for VM '{request.Name}' ({amount} sats):"
-            let tgMessageWithInvoice = invoice
-
-            let sendTgScriptPath = 
-                IO.Path.Combine(Environment.CurrentDirectory, "..", "TravelBudsFrontend", "scripts", "sendTelegramMessage.fsx")
-            for message in [ tgMessage; tgMessageWithInvoice ] do
-                let sendTgResult =
-                    Execute(
-                        { ProcessDetails.Command = "dotnet"; Arguments = $"fsi {sendTgScriptPath} \"{message}\"" }, 
-                        Echo.Off
-                    )
-                match sendTgResult.Result with
-                | Error (errorCode, output) -> 
-                    return failwith $"""Sending Telegram message with invoice failed with code {errorCode}.
-    STDOUT: {output.StdOut}
-    STDERR: {output.StdErr}
-    Working directory: {Environment.CurrentDirectory}
-    """
-                | _ -> ()
+            let sendTgScriptFile = 
+                Path.Combine(Environment.CurrentDirectory, "..", "TravelBudsFrontend", "scripts", "sendTelegramMessage.fsx")
+                |> FileInfo
+            do! self.AsyncSendInvoiceViaTelegram sendTgScriptFile invoiceData request.Name None
                 
             do!
                 self.AsyncWaitForPayment
