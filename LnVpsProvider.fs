@@ -1,4 +1,4 @@
-﻿namespace Pulumi.LNVPS
+﻿namespace Pulumi.LnVps
 
 open System
 open System.Collections.Generic
@@ -37,17 +37,17 @@ type VMTemplateType =
     | Standard
     | Custom
 
-type LNVPSProvider(nostrPrivateKey: string) =
+type LnVpsProvider(nostrPrivateKey: string) =
     inherit Pulumi.Experimental.Provider.Provider()
 
-    static let sshKeyResourceName = "lnvps:index:SshKey"
-    static let vmResourceName = "lnvps:index:VM"
-    static let customVmResourceName = "lnvps:index:CustomVM"
+    static let sshKeyResourceName = "LnVps:index:SshKey"
+    static let vmResourceName = "LnVps:index:VM"
+    static let customVmResourceName = "LnVps:index:CustomVM"
     static let apiBaseUrl = "https://api.lnvps.net"
 
     let httpClient = new HttpClient()
 
-    let email = Environment.GetEnvironmentVariable LNVPSProvider.EmailEnvVarName
+    let email = Environment.GetEnvironmentVariable LnVpsProvider.EmailEnvVarName
 
     // Provider has to advertise its version when outputting schema, e.g. for SDK generation.
     // In pulumi-lnvps, we have Pulumi generate the terraform bridge, and it automatically pulls version from the tag.
@@ -412,19 +412,45 @@ Invoice for renewal {invoiceInfo}:"
                                 }
             """
 
+        let imageIdEnumTypeName = "LnVps:index:imageId"
+        let imageIdEnumValuesArray = 
+            let regionValues =
+                Constants.Images
+                |> List.map (fun (name, value) -> sprintf """{ "name": "%s", "value": %i }""" name value)
+            sprintf
+                "[ %s ]"
+                (String.Join(", ", regionValues))
+
         let vmImageIdProperty =
-            """
-                                "image_id": {
-                                    "type": "integer",
-                                    "description": "VM image Id",
-                                    "language": {
-                                        "csharp": { 
-                                            "name": "ImageId"
+            sprintf
+                """
+                                    "image_id": {
+                                        "type": "integer",
+                                        "$ref": "#/types/%s",
+                                        "description": "VM image Id",
+                                        "language": {
+                                            "csharp": { 
+                                                "name": "ImageId"
+                                            }
                                         }
                                     }
-                                }
-            """
+                """
+                imageIdEnumTypeName
 
+        let templateIdEnumTypeName = "LnVps:index:templateId"
+        let templateIdEnumValuesArray = 
+            let regionValues =
+                Constants.Templates
+                |> List.map 
+                    (fun (name, value, description) -> 
+                        sprintf 
+                            """{ "name": "%s", "value": %i, "description": "%s" }"""
+                            name
+                            value
+                            description)
+            sprintf
+                "[ %s ]"
+                (String.Join(", ", regionValues))
         let vmInputProperties = 
             sprintf
                 """{
@@ -433,6 +459,7 @@ Invoice for renewal {invoiceInfo}:"
                                 "template_id": {
                                     "type": "integer",
                                     "description": "VM template Id",
+                                    "$ref": "#/types/%s",
                                     "language": {
                                         "csharp": { 
                                             "name": "TemplateId"
@@ -442,6 +469,7 @@ Invoice for renewal {invoiceInfo}:"
                 }"""
                 vmSshKeyProperty
                 vmImageIdProperty
+                templateIdEnumTypeName
 
         let vmProperties = 
             sprintf
@@ -468,6 +496,14 @@ Invoice for renewal {invoiceInfo}:"
 
         let customVmProperties = vmProperties
 
+        let regionIdEnumTypeName = "LnVps:index:regionId"
+        let regionIdEnumValuesArray = 
+            let regionValues =
+                Constants.Regions
+                |> List.map (fun (name, value) -> sprintf """{ "name": "%s", "value": %i }""" name value)
+            sprintf
+                "[ %s ]"
+                (String.Join(", ", regionValues))
         let customVmInputProperties = 
             sprintf
                 """{
@@ -476,6 +512,7 @@ Invoice for renewal {invoiceInfo}:"
                                 "region_id": {
                                     "type": "integer",
                                     "description": "VM region Id",
+                                    "$ref": "#/types/%s",
                                     "language": {
                                         "csharp": { 
                                             "name": "RegionId"
@@ -517,11 +554,40 @@ Invoice for renewal {invoiceInfo}:"
                 }"""
                 vmSshKeyProperty
                 vmImageIdProperty
+                regionIdEnumTypeName
+    
+        let typeDefinitions =
+            let definitions =
+                [
+                    imageIdEnumTypeName, imageIdEnumValuesArray
+                    templateIdEnumTypeName, templateIdEnumValuesArray
+                    regionIdEnumTypeName, regionIdEnumValuesArray
+                ]
+                |> List.map (
+                    fun (name, values) -> 
+                        sprintf
+                            """
+                                    "%s": {
+                                        "type": "integer",
+                                        "enum": %s
+                                    }
+                            """
+                            name
+                            values
+                    )
+            
+            sprintf
+                """
+                    {
+                        %s
+                    }
+                """
+                (String.Join($",{Environment.NewLine}", definitions))
 
         let schema =
             sprintf
                 """{
-                    "name": "lnvps",
+                    "name": "LnVps",
                     "version": "%s",
                     "resources": {
                         "%s" : {
@@ -538,9 +604,10 @@ Invoice for renewal {invoiceInfo}:"
                         }
                     },
                     "provider": {
-                    }
+                    },
+                    "types": %s
                 }"""
-                LNVPSProvider.Version
+                LnVpsProvider.Version
                 sshKeyResourceName
                 sshKeyProperties
                 sshKeyInputProperties
@@ -550,6 +617,7 @@ Invoice for renewal {invoiceInfo}:"
                 customVmResourceName
                 customVmProperties
                 customVmInputProperties
+                typeDefinitions
         
         Task.FromResult <| GetSchemaResponse(Schema = schema)
 
@@ -561,9 +629,9 @@ Invoice for renewal {invoiceInfo}:"
 
     override self.Configure (request: ConfigureRequest, ct: CancellationToken): Task<ConfigureResponse> = 
         if String.IsNullOrWhiteSpace nostrPrivateKey then
-            failwith $"Environment variable {LNVPSProvider.NostrPrivateKeyEnvVarName} not provided."
+            failwith $"Environment variable {LnVpsProvider.NostrPrivateKeyEnvVarName} not provided."
         if String.IsNullOrWhiteSpace email then
-            failwith $"Environment variable {LNVPSProvider.EmailEnvVarName} not provided."
+            failwith $"Environment variable {LnVpsProvider.EmailEnvVarName} not provided."
         Task.FromResult <| ConfigureResponse()
 
     override self.Check (request: CheckRequest, ct: CancellationToken): Task<CheckResponse> = 
