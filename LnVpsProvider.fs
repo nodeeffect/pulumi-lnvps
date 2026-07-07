@@ -96,7 +96,7 @@ type CustomHttpClient(retryCount: int, host: Pulumi.Experimental.IEngine) =
                     let! response = httpClient.SendAsync(request.Value, token) |> Async.AwaitTask
                     return response
                 with
-                | ex when IsConnectionTimedOutException ex ->
+                | ex when ex :? HttpRequestException || IsConnectionTimedOutException ex ->
                     if currentAttempt <= retryCount then
                         let offset = DateTime.Now - beforeReqTime
                         let logMessage = $"[CustomHttpClient] Retryable exception after '{offset.ToString()}': {ex.ToString()}"
@@ -104,7 +104,12 @@ type CustomHttpClient(retryCount: int, host: Pulumi.Experimental.IEngine) =
                             host.LogAsync(LogRequest(LogSeverity.Warning, logMessage))
                             |> Async.AwaitTask
                         let reqStr = request.ToString()
-                        let logMessage2 = $"[CustomHttpClient] Connection for request '{reqStr}' timed out (attempt {currentAttempt}/{retryCount + 1}). Retrying in 5s..."
+                        let retryReason = 
+                            if IsConnectionTimedOutException ex then
+                                $"Connection for request '{reqStr}' timed out"
+                            else
+                                $"Request '{reqStr}' failed with an exception '{ex.ToString()}'"
+                        let logMessage2 = $"[CustomHttpClient] {retryReason} (attempt {currentAttempt}/{retryCount + 1}). Retrying in 5s..."
                         do!
                             host.LogAsync(LogRequest(LogSeverity.Warning, logMessage2))
                             |> Async.AwaitTask
