@@ -372,6 +372,7 @@ Invoice for renewal {invoiceInfo}:"
 
             let _, vmSshKeyId = vmStatus.["ssh_key_id"].TryGetString()
             let requestSshKeyId = self.GetPropertyString(requestProperties, "ssh_key_id", __LINE__)
+            let imageId = self.GetPropertyNumber(requestProperties, "image_id", __LINE__)
 
             if vmSshKeyId <> requestSshKeyId then
                 let vmPatchRequestBody = {| ssh_key_id = uint64 requestSshKeyId |}
@@ -379,7 +380,10 @@ Invoice for renewal {invoiceInfo}:"
                     self.AsyncSendRequest($"/api/v1/vm/{vmId}", HttpMethod.Patch, Some vmPatchRequestBody)
                     |> Async.Ignore
 
-            do! self.AsyncSendRequest($"/api/v1/vm/{vmId}/re-install", HttpMethod.Patch, None) |> Async.Ignore
+            let reinstallRequestBody = {| image_id = imageId |}
+            do!
+                self.AsyncSendRequest($"/api/v1/vm/{vmId}/re-install", HttpMethod.Patch, Some reinstallRequestBody)
+                |> Async.Ignore
             do! self.AsyncWaitForVMToBeRunning (TimeSpan.FromMinutes 5.0) (TimeSpan.FromSeconds 5.0) vmId
             
             let! currentVmStatus = self.AsyncGetVMStatus vmId
