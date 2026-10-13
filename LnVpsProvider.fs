@@ -303,8 +303,8 @@ type LnVpsProvider(nostrPrivateKey: string, host: Pulumi.Experimental.IEngine) =
                                 let days = timeUntilExpiration.TotalDays |> round |> int
                                 $"{days} days"
                         
-                        $"""VM {vmName} expires on {expirationDateString}, in {daysUntilExpirationString}.
-Invoice for renewal {invoiceInfo}:"""
+                        $"VM {vmName} expires on {expirationDateString}, in {daysUntilExpirationString}.
+Invoice for renewal {invoiceInfo}:"
                     | None ->  $"Invoice for creation of new VM '{vmName}' {invoiceInfo}:"
                 String.Join(Environment.NewLine, "[Automated Message]", message)
 
