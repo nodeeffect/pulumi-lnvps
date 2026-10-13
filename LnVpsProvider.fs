@@ -295,10 +295,16 @@ type LnVpsProvider(nostrPrivateKey: string, host: Pulumi.Experimental.IEngine) =
                     match vmExpirationDate with
                     | Some expirationDate -> 
                         let expirationDateString = expirationDate.ToString("yyyy-MM-dd")
-                        let daysUntilExpiration = (expirationDate - DateTime.UtcNow).TotalDays
-                        let daysUntilExpirationRounded = daysUntilExpiration |> round |> int
-                        $"VM {vmName} expires on {expirationDateString}, in {daysUntilExpirationRounded} days.
-Invoice for renewal {invoiceInfo}:"
+                        let timeUntilExpiration = expirationDate - DateTime.UtcNow
+                        let daysUntilExpirationString =
+                            if timeUntilExpiration.TotalDays < 1.0 then
+                                "less than 1 day"
+                            else
+                                let days = timeUntilExpiration.TotalDays |> round |> int
+                                $"{days} days"
+                        
+                        $"""VM {vmName} expires on {expirationDateString}, in {daysUntilExpirationString}.
+Invoice for renewal {invoiceInfo}:"""
                     | None ->  $"Invoice for creation of new VM '{vmName}' {invoiceInfo}:"
                 String.Join(Environment.NewLine, "[Automated Message]", message)
 
