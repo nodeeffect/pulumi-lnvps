@@ -540,17 +540,23 @@ Invoice for renewal {invoiceInfo}:"
                 
             let! invoiceData = self.AsyncGetInvoice vmId
             let paymentId = invoiceData.GetProperty("id").GetString()
-            match self.SendMessageScriptPath with
-            | Some messageScriptPath ->
-                do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData request.Name None
-            | None ->
-                failwith "SendMessageScriptPath is None"
+            // If there is enough credit in account, invoice is paid automatically.
+            if invoiceData.GetProperty("is_paid").GetBoolean() then
+                // no need to do anything
+                ()
+            else
+                match self.SendMessageScriptPath with
+                | Some messageScriptPath ->
+                    do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData request.Name None
+                | None ->
+                    failwith "SendMessageScriptPath is None"
                 
-            do!
-                self.AsyncWaitForPayment
-                    (TimeSpan.FromMinutes 10.0)
-                    (TimeSpan.FromSeconds 5.0)
-                    paymentId
+                do!
+                    self.AsyncWaitForPayment
+                        (TimeSpan.FromMinutes 10.0)
+                        (TimeSpan.FromSeconds 5.0)
+                        paymentId
+
             do!
                 self.AsyncWaitForVMToBeRunning
                     (TimeSpan.FromMinutes 5.0)
@@ -561,6 +567,10 @@ Invoice for renewal {invoiceInfo}:"
             let updatedProperties = request.Properties.SetItems currentVmStatus
             return CreateResponse(Id = string vmId, Properties = updatedProperties)
         }
+
+    member private self.AsyncDeleteVM (request: DeleteRequest) =
+        self.AsyncSendRequest($"/api/v1/vm/{request.Id}", HttpMethod.Delete, None)
+        |> Async.Ignore
 
     member self.AsyncChangeEmail (email: string) =
         async {
@@ -907,7 +917,11 @@ Invoice for renewal {invoiceInfo}:"
         if request.Type = sshKeyResourceName then
             Task.FromResult <| DiffResponse(Changes = hasChanges, Replaces = changedPropertiesNames)
         elif request.Type = vmResourceName || request.Type = customVmResourceName  then
-            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = changedPropertiesNames)
+            let namesOfPropertiesThatCaBeModified = [ "ssh_key_id"; "image_id" ]
+            let canBeChanged name = namesOfPropertiesThatCaBeModified |> List.contains name
+            let diffs = changedPropertiesNames |> Array.filter canBeChanged
+            let replaces = changedPropertiesNames |> Array.filter (canBeChanged >> not)
+            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = diffs, Replaces = replaces)
         else
             failwith $"Unknown resource type '{request.Type}'"
 
@@ -959,10 +973,8 @@ Invoice for renewal {invoiceInfo}:"
         async {
             if request.Type = sshKeyResourceName then
                 return failwith $"Resource {sshKeyResourceName} does not support deletion."
-            elif request.Type = vmResourceName then
-                return failwith $"Resource {vmResourceName} does not support deletion."
-            elif request.Type = customVmResourceName then
-                return failwith $"Resource {customVmResourceName} does not support deletion."
+            elif request.Type = vmResourceName || request.Type = customVmResourceName then
+                return! self.AsyncDeleteVM request
             else
                 return failwith $"Unknown resource type '{request.Type}'"
         }
