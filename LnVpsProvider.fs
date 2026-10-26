@@ -540,17 +540,23 @@ Invoice for renewal {invoiceInfo}:"
                 
             let! invoiceData = self.AsyncGetInvoice vmId
             let paymentId = invoiceData.GetProperty("id").GetString()
-            match self.SendMessageScriptPath with
-            | Some messageScriptPath ->
-                do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData request.Name None
-            | None ->
-                failwith "SendMessageScriptPath is None"
+            // If there is enough credit in account, invoice is paid automatically.
+            if invoiceData.GetProperty("is_paid").GetBoolean() then
+                // no need to do anything
+                ()
+            else
+                match self.SendMessageScriptPath with
+                | Some messageScriptPath ->
+                    do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData request.Name None
+                | None ->
+                    failwith "SendMessageScriptPath is None"
                 
-            do!
-                self.AsyncWaitForPayment
-                    (TimeSpan.FromMinutes 10.0)
-                    (TimeSpan.FromSeconds 5.0)
-                    paymentId
+                do!
+                    self.AsyncWaitForPayment
+                        (TimeSpan.FromMinutes 10.0)
+                        (TimeSpan.FromSeconds 5.0)
+                        paymentId
+
             do!
                 self.AsyncWaitForVMToBeRunning
                     (TimeSpan.FromMinutes 5.0)
