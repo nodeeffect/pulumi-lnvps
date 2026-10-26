@@ -568,6 +568,10 @@ Invoice for renewal {invoiceInfo}:"
             return CreateResponse(Id = string vmId, Properties = updatedProperties)
         }
 
+    member private self.AsyncDeleteVM (request: DeleteRequest) =
+        self.AsyncSendRequest($"/api/v1/vm/{request.Id}", HttpMethod.Delete, None)
+        |> Async.Ignore
+
     member self.AsyncChangeEmail (email: string) =
         async {
             let! accountInfoResponse = self.AsyncSendRequest("/api/v1/account", HttpMethod.Get, None)
@@ -965,10 +969,8 @@ Invoice for renewal {invoiceInfo}:"
         async {
             if request.Type = sshKeyResourceName then
                 return failwith $"Resource {sshKeyResourceName} does not support deletion."
-            elif request.Type = vmResourceName then
-                return failwith $"Resource {vmResourceName} does not support deletion."
-            elif request.Type = customVmResourceName then
-                return failwith $"Resource {customVmResourceName} does not support deletion."
+            elif request.Type = vmResourceName || request.Type = customVmResourceName then
+                return! self.AsyncDeleteVM request
             else
                 return failwith $"Unknown resource type '{request.Type}'"
         }
