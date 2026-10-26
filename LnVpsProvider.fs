@@ -917,7 +917,11 @@ Invoice for renewal {invoiceInfo}:"
         if request.Type = sshKeyResourceName then
             Task.FromResult <| DiffResponse(Changes = hasChanges, Replaces = changedPropertiesNames)
         elif request.Type = vmResourceName || request.Type = customVmResourceName  then
-            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = changedPropertiesNames)
+            let namesOfPropertiesThatCaBeModified = [ "ssh_key_id"; "image_id" ]
+            let canBeChanged name = namesOfPropertiesThatCaBeModified |> List.contains name
+            let diffs = changedPropertiesNames |> Array.filter canBeChanged
+            let replaces = changedPropertiesNames |> Array.filter (canBeChanged >> not)
+            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = diffs, Replaces = replaces)
         else
             failwith $"Unknown resource type '{request.Type}'"
 
