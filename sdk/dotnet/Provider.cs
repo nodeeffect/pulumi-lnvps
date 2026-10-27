@@ -45,6 +45,9 @@ namespace Pulumi.Lnvps
         [Input("sendMessageScriptPath", required: true)]
         public Input<string> SendMessageScriptPath { get; set; } = null!;
 
+        [Input("useAccountBalance", json: true)]
+        public Input<bool>? UseAccountBalance { get; set; }
+
         public ProviderArgs()
         {
         }
