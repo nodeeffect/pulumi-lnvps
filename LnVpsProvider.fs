@@ -50,6 +50,10 @@ type VMTemplateType =
     | Standard
     | Custom
 
+type PaymentKind =
+    | SpecificResourcePayment of paymentId: string
+    | AccountBalanceTopUp of paymentHash: string
+
 type CustomHttpReqMsg(method: HttpMethod, absoluteUrl: string, maybeContent: Option<obj>) =
     let innerReq =
         let message = new HttpRequestMessage(method, absoluteUrl)
@@ -182,6 +186,9 @@ type LnVpsProvider(nostrPrivateKey: string, host: Pulumi.Experimental.IEngine) =
 
     member val SendMessageScriptPath: Option<FileInfo> = None with get, set
 
+    /// If true, and there are not enough funds, post an invoice for topping up account instead of invoice for VM order.
+    member val UseAccountBalance = false with get, set
+
     // Provider has to advertise its version when outputting schema, e.g. for SDK generation.
     // In pulumi-lnvps, we have Pulumi generate the terraform bridge, and it automatically pulls version from the tag.
     // Use sdk/dotnet/version.txt as source of version number.
@@ -305,7 +312,11 @@ type LnVpsProvider(nostrPrivateKey: string, host: Pulumi.Experimental.IEngine) =
                         
                         $"VM {vmName} expires on {expirationDateString}, in {daysUntilExpirationString}.
 Invoice for renewal {invoiceInfo}:"
-                    | None ->  $"Invoice for creation of new VM '{vmName}' {invoiceInfo}:"
+                    | None -> 
+                        if self.UseAccountBalance then
+                            $"Invoice for topping-up balance; next action: creation of VM '{vmName}' {invoiceInfo}:"
+                        else
+                            $"Invoice for creation of new VM '{vmName}' {invoiceInfo}:"
                 String.Join(Environment.NewLine, "[Automated Message]", message)
 
             let tgMessageWithInvoice = invoice
@@ -383,7 +394,7 @@ Invoice for renewal {invoiceInfo}:"
             return! loop ()
         }
 
-    member private self.AsyncWaitForPayment (maxWaitTime: TimeSpan) (timeBetweenRetries: TimeSpan) (paymentId: string) =
+    member private self.AsyncWaitForPayment (maxWaitTime: TimeSpan) (timeBetweenRetries: TimeSpan) (paymentKind: PaymentKind) =
         async {
             let stopWatch = Diagnostics.Stopwatch()
             stopWatch.Start()
@@ -391,10 +402,18 @@ Invoice for renewal {invoiceInfo}:"
             let rec loop () =
                 async {
                     if stopWatch.Elapsed >= maxWaitTime then
-                        return failwith $"Payment id={paymentId} is still not paid after {maxWaitTime}."
+                        let paymentDescription =
+                            match paymentKind with
+                            | SpecificResourcePayment paymentId -> $"id={paymentId}"
+                            | AccountBalanceTopUp paymentHash -> $"payment_hash={paymentHash}"
+                        return failwith $"Payment {paymentDescription} is still not paid after {maxWaitTime}."
                     else
                         do! Async.Sleep timeBetweenRetries
-                        let! response = self.AsyncSendRequest($"/api/v1/payment/{paymentId}", HttpMethod.Get, None)
+                        let url =
+                            match paymentKind with
+                            | SpecificResourcePayment paymentId -> $"/api/v1/payment/{paymentId}"
+                            | AccountBalanceTopUp paymentHash -> $"/api/v1/account/credit/topup/{paymentHash}"
+                        let! response = self.AsyncSendRequest(url, HttpMethod.Get, None)
                         let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
                         let responseJson = JsonDocument.Parse(responseBody).RootElement.GetProperty "data"
                         if responseJson.GetProperty("is_paid").GetBoolean() then
@@ -446,92 +465,198 @@ Invoice for renewal {invoiceInfo}:"
             return requestProperties.SetItems currentVmStatus
         }
 
+    member private self.GetTemplatesData() =
+        async {
+            let! templatesResponse = self.AsyncSendRequest("/api/v1/vm/templates", HttpMethod.Get, None)
+            let! templatesResponseBody = templatesResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+            return JsonDocument.Parse(templatesResponseBody).RootElement.GetProperty "data"
+        }
+
+    member private self.GetCustomTemplateIdForRegion (regionId: uint64) =
+        async {
+            let! templatesData = self.GetTemplatesData()
+            let customTemplates = templatesData.GetProperty("custom_template").EnumerateArray()
+            let template =
+                customTemplates
+                |> Seq.tryFind 
+                    (fun templateObject ->
+                        templateObject.GetProperty("region").GetProperty("id").GetUInt64() = regionId)
+            match template with
+            | Some templateObject -> return templateObject.GetProperty("id").GetUInt64()
+            | None -> return failwithf "Could not find custom template with region id = %i" regionId
+        }
+
+    member private self.GetCustomVmRequest (requestProperties: ImmutableDictionary<string, PropertyValue>) =
+        async {
+            let regionId = self.GetPropertyNumber(requestProperties, "region_id", __LINE__) |> uint64
+            let! pricingId = self.GetCustomTemplateIdForRegion regionId
+            let bytesInGigabyte = 1024.0 ** 3
+            let memoryInBytes = self.GetPropertyNumber(requestProperties, "memory", __LINE__) * bytesInGigabyte
+            let diskInBytes = self.GetPropertyNumber(requestProperties, "disk", __LINE__) * bytesInGigabyte
+            let disk_type = self.GetPropertyString(requestProperties, "disk_type", __LINE__)
+            let disk_interface =
+                match self.GetPropertyString(requestProperties, "disk_interface", __LINE__) with
+                | "auto" ->
+                    match disk_type with
+                    | "ssd" -> "pcie"
+                    | "hdd" -> "sata"
+                    | otherType -> failwithf "Unknown disk type: %s" otherType
+                | value -> value
+            return
+                {|
+                    pricing_id = pricingId
+                    cpu = self.GetPropertyNumber(requestProperties, "cpu", __LINE__)
+                    memory = memoryInBytes
+                    disk = diskInBytes
+                    disk_type = disk_type
+                    disk_interface = disk_interface        
+                |}
+        }
+
+    member private self.GetSatsAmountFromPriceInfo (priceInfo: JsonElement) =
+        async {
+            let currency = priceInfo.GetProperty("currency").GetString()
+            let amount = priceInfo.GetProperty("amount").GetDouble()
+            if currency = "BTC" then
+                // LNVPS API uses millisats for BTC
+                return (amount / 1000.0) |> ceil |> uint64
+            else
+                let! exchangeRatesResponse = self.AsyncSendRequest("/api/v1/exchange-rate", HttpMethod.Get, None)
+                let! exchangeRatesResponseBody = exchangeRatesResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+                let exchangeRates =
+                    JsonDocument
+                        .Parse(exchangeRatesResponseBody)
+                        .RootElement
+                        .GetProperty("data")
+                        .GetProperty("rates")
+                let rate = exchangeRates.GetProperty(currency).GetDouble()
+                let satsInBTC = pown 10.0 8
+                // LNVPS API uses cents for fiat currencies
+                return (amount / 100.0) / rate * satsInBTC |> ceil |> uint64
+        }
+
+    member private self.GetCustomVmPrice customVmRequestObject =
+        async {
+            let! response =
+                self.AsyncSendRequest(
+                        "/api/v1/vm/custom-template/price",
+                        HttpMethod.Post,
+                        Some customVmRequestObject
+                    )
+            let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+            let priceInfoJson = JsonDocument.Parse(responseBody).RootElement.GetProperty "data"
+            return! self.GetSatsAmountFromPriceInfo priceInfoJson
+        }
+
+    member private self.GetStandardVmPrice (templateId: uint64) =
+        async {
+            let! templatesData = self.GetTemplatesData()
+            let maybeTemplate =
+                templatesData.GetProperty("templates").EnumerateArray()
+                |> Seq.tryFind (fun template -> template.GetProperty("id").GetUInt64() = templateId)
+            match maybeTemplate with
+            | Some template -> return! self.GetSatsAmountFromPriceInfo <| template.GetProperty("cost_plan")
+            | None -> return failwith $"Template with id={templateId} was not found."
+        }
+
     member private self.AsyncCreateVM (vmTemplateType: VMTemplateType) (request: CreateRequest) =
         async {
-            let createVmRequest =
+            let createVmRequest, priceRequest =
                 let imageId = self.GetPropertyNumber(request.Properties, "image_id", __LINE__)
                 let sshKeyId = self.GetPropertyString(request.Properties, "ssh_key_id", __LINE__)
 
                 match vmTemplateType with
                 | Standard ->
+                    let templateId = self.GetPropertyNumber(request.Properties, "template_id", __LINE__) |> uint64
                     let createVmRequestObject =
                         {|
-                            template_id = self.GetPropertyNumber(request.Properties, "template_id", __LINE__)
+                            template_id = templateId
                             image_id = imageId
                             ssh_key_id = uint64 sshKeyId
                         |}
-                    self.AsyncSendRequest("/api/v1/vm", HttpMethod.Post, Some createVmRequestObject)
+                    self.AsyncSendRequest("/api/v1/vm", HttpMethod.Post, Some createVmRequestObject), self.GetStandardVmPrice templateId
                 | Custom ->
-                    async {
-                        let regionId = self.GetPropertyNumber(request.Properties, "region_id", __LINE__) |> uint64
-                        let! templatesResponse = self.AsyncSendRequest("/api/v1/vm/templates", HttpMethod.Get, None)
-                        let! templatesResponseBody = templatesResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
-                        let templatesJson = JsonDocument.Parse(templatesResponseBody).RootElement.GetProperty "data"
-                        let customTemplates = templatesJson.GetProperty("custom_template").EnumerateArray()
-                        let pricingId = 
-                            let template =
-                                customTemplates
-                                |> Seq.tryFind 
-                                    (fun templateObject ->
-                                        templateObject.GetProperty("region").GetProperty("id").GetUInt64() = regionId)
-                            match template with
-                            | Some templateObject -> templateObject.GetProperty("id").GetUInt64()
-                            | None -> failwithf "Could not find custom template with region id = %i" regionId
-
-                        let bytesInGigabyte = 1024.0 ** 3
-                        let memoryInBytes = self.GetPropertyNumber(request.Properties, "memory", __LINE__) * bytesInGigabyte
-                        let diskInBytes = self.GetPropertyNumber(request.Properties, "disk", __LINE__) * bytesInGigabyte
-                        let customVmOrderObject =
-                            let disk_type = self.GetPropertyString(request.Properties, "disk_type", __LINE__)
-                            let disk_interface =
-                                match self.GetPropertyString(request.Properties, "disk_interface", __LINE__) with
-                                | "auto" ->
-                                    match disk_type with
-                                    | "ssd" -> "pcie"
-                                    | "hdd" -> "sata"
-                                    | otherType -> failwithf "Unknown disk type: %s" otherType
-                                | value -> value
-                            {|
-                                pricing_id = pricingId
-                                cpu = self.GetPropertyNumber(request.Properties, "cpu", __LINE__)
-                                memory = memoryInBytes
-                                disk = diskInBytes
-                                disk_type = disk_type
-                                disk_interface = disk_interface
-                                image_id = imageId
-                                ssh_key_id = uint64 sshKeyId
-                            |}
-                        let createCustomTemplateVmRequest =
-                            self.AsyncSendRequest(
-                                    "/api/v1/vm/custom-template",
-                                    HttpMethod.Post,
-                                    Some customVmOrderObject
-                                )
-                        try
-                            return! createCustomTemplateVmRequest
-                        with
-                        | :? RequestFailed as exn when 
-                            JsonDocument.Parse(exn.ResponseBody)
-                                .RootElement
-                                .GetProperty("error")
-                                .GetString()
-                                .Contains("Email verification is required") ->
-                            let! accountInfoResponse = self.AsyncSendRequest("/api/v1/account", HttpMethod.Get, None)
-                            let! accountResponseBody = accountInfoResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
-                            let accountJson = Nodes.JsonNode.Parse(accountResponseBody).["data"]
-            
-                            accountJson.["email"] <- Nodes.JsonValue.Create email
-
-                            let! _ =
+                    let vmRequest =
+                        async {
+                            let! customVmRequest = self.GetCustomVmRequest request.Properties
+                            let customVmOrderObject = 
+                                {| customVmRequest 
+                                    with image_id = imageId; ssh_key_id = uint64 sshKeyId |}
+                            let createCustomTemplateVmRequest =
                                 self.AsyncSendRequest(
-                                    "/api/v1/account", 
-                                    HttpMethod.Patch, 
-                                    Some accountJson
-                                )
+                                        "/api/v1/vm/custom-template",
+                                        HttpMethod.Post,
+                                        Some customVmOrderObject
+                                    )
+                            try
+                                return! createCustomTemplateVmRequest
+                            with
+                            | :? RequestFailed as exn when 
+                                JsonDocument.Parse(exn.ResponseBody)
+                                    .RootElement
+                                    .GetProperty("error")
+                                    .GetString()
+                                    .Contains("Email verification is required") ->
+                                let! accountInfoResponse = self.AsyncSendRequest("/api/v1/account", HttpMethod.Get, None)
+                                let! accountResponseBody = accountInfoResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+                                let accountJson = Nodes.JsonNode.Parse(accountResponseBody).["data"]
+            
+                                accountJson.["email"] <- Nodes.JsonValue.Create email
+
+                                let! _ =
+                                    self.AsyncSendRequest(
+                                        "/api/v1/account", 
+                                        HttpMethod.Patch, 
+                                        Some accountJson
+                                    )
                             
-                            let errorMessage = $"Email verification is needed, please verify it checking inbox of {email} and retry deploy after that"
-                            return raise <| EmailVerificationRequired errorMessage
-                    }
+                                let errorMessage = $"Email verification is needed, please verify it checking inbox of {email} and retry deploy after that"
+                                return raise <| EmailVerificationRequired errorMessage
+                        }
+                    let priceRequest =
+                        async {
+                            let! customVmRequest = self.GetCustomVmRequest request.Properties
+                            return! self.GetCustomVmPrice customVmRequest 
+                        }
+                    vmRequest, priceRequest
+            
+            if self.UseAccountBalance then
+                let! priceInSats = priceRequest
+                let! balanceRequestResponse = self.AsyncSendRequest("/api/v1/account/credit", HttpMethod.Get, None)
+                let! balanceResponseBody = balanceRequestResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+                let balanceJson = JsonDocument.Parse(balanceResponseBody).RootElement.GetProperty "data"
+                let balance = balanceJson.GetProperty("balance").GetUInt64()
+                let autoApply = balanceJson.GetProperty("auto_apply").GetBoolean()
+
+                if balance < priceInSats then
+                    // Top-up balance. LNVPS uses millisats.
+                    let topUpRequestBody = {| amount = priceInSats * 1000UL - balance; method = "lightning" |}
+                    let! topUpResponse = 
+                        self.AsyncSendRequest(
+                            "/api/v1/account/credit/topup",
+                            HttpMethod.Post, 
+                            Some topUpRequestBody
+                        )
+                    let! topUpResponseBody = topUpResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+                    let invoiceData = JsonDocument.Parse(topUpResponseBody).RootElement.GetProperty "data"
+                    let paymentHash = invoiceData.GetProperty("payment_hash").GetString()
+
+                    match self.SendMessageScriptPath with
+                    | Some messageScriptPath ->
+                        do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData request.Name None
+                    | None ->
+                        failwith "SendMessageScriptPath is None"
+
+                    do!
+                        self.AsyncWaitForPayment
+                            (TimeSpan.FromMinutes 10.0)
+                            (TimeSpan.FromSeconds 5.0)
+                            (AccountBalanceTopUp paymentHash)
+
+                if not autoApply then
+                    do!
+                        self.AsyncSendRequest("/api/v1/account/credit", HttpMethod.Patch, Some {| auto_apply = true |})
+                        |> Async.Ignore
 
             let! response = createVmRequest
             let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
@@ -555,7 +680,7 @@ Invoice for renewal {invoiceInfo}:"
                     self.AsyncWaitForPayment
                         (TimeSpan.FromMinutes 10.0)
                         (TimeSpan.FromSeconds 5.0)
-                        paymentId
+                        (SpecificResourcePayment paymentId)
 
             do!
                 self.AsyncWaitForVMToBeRunning
@@ -848,6 +973,9 @@ Invoice for renewal {invoiceInfo}:"
                             },
                             "apiBaseUrl": {
                                 "type": "string"
+                            },
+                            "useAccountBalance": {
+                                "type": "boolean"
                             }
                         },
                         "requiredInputs": [ "sendMessageScriptPath" ]
@@ -900,6 +1028,21 @@ Invoice for renewal {invoiceInfo}:"
 
         if self.SendMessageScriptPath.IsNone then
             failwith "sendMessageScriptPath is required"
+
+        match request.Args.TryGetValue "useAccountBalance" with
+        | true, value ->
+            match value.TryGetBool() with
+            | true, useAccountBalance ->
+                self.UseAccountBalance <- useAccountBalance
+            | false, _ ->
+                // true/false value may be encoded as string
+                match value.TryGetString() with
+                | true, "true" ->
+                    self.UseAccountBalance <- true
+                | true, "false" ->
+                    self.UseAccountBalance <- false
+                | _ -> ()
+        | false, _ -> ()
 
         Task.FromResult <| ConfigureResponse()
 
