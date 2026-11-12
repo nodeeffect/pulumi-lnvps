@@ -326,27 +326,76 @@ Invoice for renewal {invoiceInfo}:"
                 | _ -> ()
         }
 
+    member private self.ExtractVmProperties(vmStatusJson: JsonElement) =
+        let status = PropertyValue(vmStatusJson.GetProperty("status").GetProperty("state").GetString())
+        let ipAssignments =
+            vmStatusJson.GetProperty("ip_assignments").EnumerateArray()
+            |> Seq.map 
+                (fun jsonObject -> 
+                    let ipWithSubnetMask = jsonObject.GetProperty("ip").GetString()
+                    let ip = ipWithSubnetMask.Split('/').[0]
+                    PropertyValue ip)
+            |> ImmutableArray.CreateRange
+            |> PropertyValue
+        let sshKeyId =
+            vmStatusJson.GetProperty("ssh_key").GetProperty("id").GetUInt64().ToString()
+            |> PropertyValue
+                    
+        [ "status", status; "ip_assignments", ipAssignments; "ssh_key_id", sshKeyId ]
+
     member private self.AsyncGetVMStatus(vmId: uint64) =
         async {
             let! response = self.AsyncSendRequest($"/api/v1/vm/{vmId}", HttpMethod.Get, None)
             let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
             let vmStatusJson = JsonDocument.Parse(responseBody).RootElement.GetProperty "data"
+            return dict <| self.ExtractVmProperties vmStatusJson
+        }
 
-            let status = PropertyValue(vmStatusJson.GetProperty("status").GetProperty("state").GetString())
-            let ipAssignments =
-                vmStatusJson.GetProperty("ip_assignments").EnumerateArray()
-                |> Seq.map 
-                    (fun jsonObject -> 
-                        let ipWithSubnetMask = jsonObject.GetProperty("ip").GetString()
-                        let ip = ipWithSubnetMask.Split('/').[0]
-                        PropertyValue ip)
-                |> ImmutableArray.CreateRange
-                |> PropertyValue
-            let sshKeyId =
+    member private self.AsyncReadVmResource (vmId: uint64) (vmKind: VMTemplateType) =
+        async {
+            let! response = self.AsyncSendRequest($"/api/v1/vm/{vmId}", HttpMethod.Get, None)
+            let! responseBody = response.Content.ReadAsStringAsync() |> Async.AwaitTask
+            let vmStatusJson = JsonDocument.Parse(responseBody).RootElement.GetProperty "data"
+
+            let ssh_key_id =
                 vmStatusJson.GetProperty("ssh_key").GetProperty("id").GetUInt64().ToString()
                 |> PropertyValue
-                    
-            return dict [ "status", status; "ip_assignments", ipAssignments; "ssh_key_id", sshKeyId ]
+
+            let template = vmStatusJson.GetProperty("template")
+
+            let image = vmStatusJson.GetProperty("image")
+            let image_id = image.GetProperty("id").GetUInt64() |> float |> PropertyValue
+
+            let commonVmInputProperties = [ "ssh_key_id", ssh_key_id; "image_id", image_id ]
+
+            let vmInputProperties =
+                match vmKind with
+                | Standard ->
+                    let template_id = template.GetProperty("id").GetUInt64() |> float |> PropertyValue
+                    [ "template_id", template_id ]
+                | Custom ->
+                    let bytesInGB = pown 1024UL 3
+                    let region_id = template.GetProperty("region").GetProperty("id").GetUInt64() |> float |> PropertyValue
+                    let cpu = template.GetProperty("cpu").GetUInt64() |> float |> PropertyValue
+                    let memory = (template.GetProperty("memory").GetUInt64() / bytesInGB) |> float |> PropertyValue
+                    let disk = (template.GetProperty("disk_size").GetUInt64() / bytesInGB) |> float |> PropertyValue
+                    let disk_type = template.GetProperty("disk_type").GetString() |> PropertyValue
+                    let disk_interface = template.GetProperty("disk_interface").GetString() |> PropertyValue
+                    [ 
+                        
+                        "region_id", region_id
+                        "cpu", cpu
+                        "memory", memory
+                        "disk", disk
+                        "disk_type", disk_type
+                        "disk_interface", disk_interface
+                    ]
+            
+            return 
+                {|
+                    Inputs = dict (commonVmInputProperties @ vmInputProperties)
+                    Properties = dict (self.ExtractVmProperties vmStatusJson)
+                |}
         }
 
     member private self.AsyncWaitForVMToBeRunning (maxWaitTime: TimeSpan) (timeBetweenRetires: TimeSpan) (vmId: uint64) =
@@ -910,7 +959,7 @@ Invoice for renewal {invoiceInfo}:"
             failwith $"Unknown resource type '{request.Type}'"
 
     override self.Diff (request: DiffRequest, _ct: CancellationToken): Task<DiffResponse> =
-        let diff = request.NewInputs.Except request.OldState 
+        let diff = (request.NewInputs.Except request.OldInputs).Except request.OldState
         let changedPropertiesNames = diff |> Seq.map (fun pair -> pair.Key) |> Seq.toArray
         let hasChanges = changedPropertiesNames.Length > 0
 
@@ -919,9 +968,8 @@ Invoice for renewal {invoiceInfo}:"
         elif request.Type = vmResourceName || request.Type = customVmResourceName  then
             let namesOfPropertiesThatCaBeModified = [ "ssh_key_id"; "image_id" ]
             let canBeChanged name = namesOfPropertiesThatCaBeModified |> List.contains name
-            let diffs = changedPropertiesNames |> Array.filter canBeChanged
             let replaces = changedPropertiesNames |> Array.filter (canBeChanged >> not)
-            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = diffs, Replaces = replaces)
+            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = changedPropertiesNames, Replaces = replaces)
         else
             failwith $"Unknown resource type '{request.Type}'"
 
@@ -997,9 +1045,14 @@ Invoice for renewal {invoiceInfo}:"
                     return ReadResponse(Id = request.Id, Properties = properties, Inputs = request.Inputs)
                 | None ->
                     return failwith $"{sshKeyResourceName} with Id={request.Id} not found"
-            elif request.Type = vmResourceName || request.Type = customVmResourceName  then
-                let! vmProperties = self.AsyncGetVMStatus (uint64 request.Id)
-                return ReadResponse(Id = request.Id, Properties = vmProperties, Inputs = request.Inputs)
+            elif request.Type = vmResourceName || request.Type = customVmResourceName then
+                let vmKind =
+                    if request.Type = vmResourceName then
+                        Standard
+                    else
+                        Custom
+                let! vmState = self.AsyncReadVmResource (uint64 request.Id) vmKind
+                return ReadResponse(Id = request.Id, Properties = vmState.Properties, Inputs = vmState.Inputs)
             else
                 return failwith $"Unknown resource type '{request.Type}'"
         }
