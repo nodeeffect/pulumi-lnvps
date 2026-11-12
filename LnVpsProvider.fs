@@ -959,7 +959,7 @@ Invoice for renewal {invoiceInfo}:"
             failwith $"Unknown resource type '{request.Type}'"
 
     override self.Diff (request: DiffRequest, _ct: CancellationToken): Task<DiffResponse> =
-        let diff = request.NewInputs.Except request.OldState 
+        let diff = (request.NewInputs.Except request.OldInputs).Except request.OldState
         let changedPropertiesNames = diff |> Seq.map (fun pair -> pair.Key) |> Seq.toArray
         let hasChanges = changedPropertiesNames.Length > 0
 
@@ -968,9 +968,8 @@ Invoice for renewal {invoiceInfo}:"
         elif request.Type = vmResourceName || request.Type = customVmResourceName  then
             let namesOfPropertiesThatCaBeModified = [ "ssh_key_id"; "image_id" ]
             let canBeChanged name = namesOfPropertiesThatCaBeModified |> List.contains name
-            let diffs = changedPropertiesNames |> Array.filter canBeChanged
             let replaces = changedPropertiesNames |> Array.filter (canBeChanged >> not)
-            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = diffs, Replaces = replaces)
+            Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = changedPropertiesNames, Replaces = replaces)
         else
             failwith $"Unknown resource type '{request.Type}'"
 
