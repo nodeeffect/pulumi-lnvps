@@ -173,6 +173,7 @@ type LnVpsProvider(nostrPrivateKey: string, host: Pulumi.Experimental.IEngine) =
     static let sshKeyResourceName = "lnvps:index:SshKey"
     static let vmResourceName = "lnvps:index:VM"
     static let customVmResourceName = "lnvps:index:CustomVM"
+    let upgradeableVmPropertyNames = [ "cpu"; "memory"; "disk" ]
 
     let httpClient = new CustomHttpClient(7, host)
 
@@ -455,9 +456,31 @@ Invoice for renewal {invoiceInfo}:"
             return! loop ()
         }
 
-    member private self.AsyncUpdateVM (vmId: uint64) (requestProperties: ImmutableDictionary<string, PropertyValue>) =
+    member private self.AsyncUpdateVM
+        (vmId: uint64)
+        (requestProperties: ImmutableDictionary<string, PropertyValue>)
+        (vmName: string) =
         async {
             let! vmStatus = self.AsyncGetVMStatus vmId
+
+            let propertiesToUpgrade =
+                requestProperties
+                |> Seq.filter (fun pair -> upgradeableVmPropertyNames |> Seq.contains pair.Key)
+                |> Seq.map (fun pair -> pair.Key, pair.Value)
+                |> Map.ofSeq
+
+            if not propertiesToUpgrade.IsEmpty then
+                let upgradeRequest =
+                    propertiesToUpgrade 
+                    |> Map.map 
+                        (fun key value -> 
+                            match value.TryGetNumber() with
+                            | true, number -> number
+                            | false, _ -> failwithf "Expected number at key %s" key)
+                let! upgradeResponse = self.AsyncSendRequest($"/api/v1/vm/{vmId}/upgrade", HttpMethod.Post, Some upgradeRequest)
+                let! upgradeResponseBody = upgradeResponse.Content.ReadAsStringAsync() |> Async.AwaitTask
+                let invoiceData = JsonDocument.Parse(upgradeResponseBody).RootElement.GetProperty "data"
+                do! self.PayInvoiceIfNeeded invoiceData vmName
 
             let _, vmSshKeyId = vmStatus.["ssh_key_id"].TryGetString()
             let requestSshKeyId = self.GetPropertyString(requestProperties, "ssh_key_id", __LINE__)
@@ -493,6 +516,27 @@ Invoice for renewal {invoiceInfo}:"
             
             let! currentVmStatus = self.AsyncGetVMStatus vmId
             return requestProperties.SetItems currentVmStatus
+        }
+
+    member private self.PayInvoiceIfNeeded (invoiceData: JsonElement) (vmName: string) =
+        async {
+            let paymentId = invoiceData.GetProperty("id").GetString()
+            // If there is enough credit in account, invoice is paid automatically.
+            if invoiceData.GetProperty("is_paid").GetBoolean() then
+                // no need to do anything
+                ()
+            else
+                match self.SendMessageScriptPath with
+                | Some messageScriptPath ->
+                    do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData vmName None
+                | None ->
+                    failwith "SendMessageScriptPath is None"
+                
+                do!
+                    self.AsyncWaitForPayment
+                        (TimeSpan.FromMinutes 10.0)
+                        (TimeSpan.FromSeconds 5.0)
+                        paymentId
         }
 
     member private self.AsyncCreateVM (vmTemplateType: VMTemplateType) (request: CreateRequest) =
@@ -588,23 +632,7 @@ Invoice for renewal {invoiceInfo}:"
             let vmId = vmStatus.GetProperty("id").GetUInt64()
                 
             let! invoiceData = self.AsyncGetInvoice vmId
-            let paymentId = invoiceData.GetProperty("id").GetString()
-            // If there is enough credit in account, invoice is paid automatically.
-            if invoiceData.GetProperty("is_paid").GetBoolean() then
-                // no need to do anything
-                ()
-            else
-                match self.SendMessageScriptPath with
-                | Some messageScriptPath ->
-                    do! self.AsyncSendInvoiceViaTelegram messageScriptPath invoiceData request.Name None
-                | None ->
-                    failwith "SendMessageScriptPath is None"
-                
-                do!
-                    self.AsyncWaitForPayment
-                        (TimeSpan.FromMinutes 10.0)
-                        (TimeSpan.FromSeconds 5.0)
-                        paymentId
+            do! self.PayInvoiceIfNeeded invoiceData request.Name
 
             do!
                 self.AsyncWaitForVMToBeRunning
@@ -967,7 +995,19 @@ Invoice for renewal {invoiceInfo}:"
             Task.FromResult <| DiffResponse(Changes = hasChanges, Replaces = changedPropertiesNames)
         elif request.Type = vmResourceName || request.Type = customVmResourceName  then
             let namesOfPropertiesThatCaBeModified = [ "ssh_key_id"; "image_id" ]
-            let canBeChanged name = namesOfPropertiesThatCaBeModified |> List.contains name
+            let canBeChanged name =
+                if namesOfPropertiesThatCaBeModified |> List.contains name then
+                    true
+                elif upgradeableVmPropertyNames |> List.contains name then
+                    let newValue = self.GetPropertyNumber(request.NewInputs, name, __LINE__)
+                    let oldValue =
+                        if request.OldInputs.ContainsKey name then
+                            self.GetPropertyNumber(request.OldInputs, name, __LINE__)
+                        else
+                            self.GetPropertyNumber(request.OldState, name, __LINE__)
+                    newValue > oldValue
+                else
+                    false
             let replaces = changedPropertiesNames |> Array.filter (canBeChanged >> not)
             Task.FromResult <| DiffResponse(Changes = hasChanges, Diffs = changedPropertiesNames, Replaces = replaces)
         else
@@ -1008,7 +1048,7 @@ Invoice for renewal {invoiceInfo}:"
                 return failwith $"Resource {sshKeyResourceName} does not support updating."
             elif request.Type = vmResourceName || request.Type = customVmResourceName  then
                 let properties = request.Olds.SetItems request.News
-                let! updatedProperties = self.AsyncUpdateVM (uint64 request.Id) properties
+                let! updatedProperties = self.AsyncUpdateVM (uint64 request.Id) properties request.Name
                 return UpdateResponse(Properties = updatedProperties)
             else
                 return failwith $"Unknown resource type '{request.Type}'"
