@@ -82,13 +82,6 @@ type CustomHttpClient(retryCount: int, host: Pulumi.Experimental.IEngine) =
     // (passed via CancellationToken) is the only one that controls cancellation.
     do httpClient.Timeout <- Threading.Timeout.InfiniteTimeSpan
 
-    static let retryableErrorCodes = 
-        [ 
-            int HttpStatusCode.InternalServerError
-            // Clouflare-specific "A Timeout Occurred" error, see https://github.com/LNVPS/api/issues/395
-            524 
-        ]
-
     static let IsConnectionTimedOutException (ex: Exception) =
         let rec checkException (e: Exception) =
             if isNull e then
@@ -146,7 +139,8 @@ type CustomHttpClient(retryCount: int, host: Pulumi.Experimental.IEngine) =
 
                 try
                     let! response = httpClient.SendAsync(request.Value, token) |> Async.AwaitTask
-                    if List.contains (int response.StatusCode) retryableErrorCodes then
+                    // retry on all 5XX errors
+                    if (int response.StatusCode) / 100 = 5 then
                         let! requestFailedException = RequestFailed.AsyncFromResponse response
                         return! retry requestFailedException
                     else
